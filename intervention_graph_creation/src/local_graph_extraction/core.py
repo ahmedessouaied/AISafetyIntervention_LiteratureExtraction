@@ -80,6 +80,21 @@ class Edge(BaseModel):
         if self.source_node == self.target_node:
             raise ValueError("self-loop edges are not allowed (source_node == target_node)")
         return self
+    
+
+class Meta(BaseModel):
+    key: str = Field(min_length=1, max_length=64, description="metadata key")
+    value: str = Field(min_length=1, max_length=256, description="metadata value")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("key", "value")
+    @classmethod
+    def _strip_nonempty(cls, v: str) -> str:
+        v2 = v.strip()
+        if not v2:
+            raise ValueError("must be non-empty")
+        return v2
 
 
 class LogicalChain(BaseModel):
@@ -91,4 +106,5 @@ class LogicalChain(BaseModel):
 class PaperSchema(BaseModel):
     nodes: List[Node] = Field(default_factory=list)
     logical_chains: List[LogicalChain] = Field(default_factory=list)
+    meta: List[Meta] = Field(default_factory=list)
     model_config = ConfigDict(extra="forbid")

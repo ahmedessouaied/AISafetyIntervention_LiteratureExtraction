@@ -3,9 +3,24 @@ import traceback
 import re
 from pathlib import Path
 from typing import Any, Optional, Tuple
+from urllib.parse import urlparse
 
 
 FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S | re.I)
+
+
+def extract_output_text(resp: Any) -> str:
+    """Return assistant's textual output, tolerating various SDK shapes."""
+    value = getattr(resp, "output_text", "")
+    return value if isinstance(value, str) else str(value or "")
+
+
+def filter_dict(d: dict, keys: set) -> list[dict]:
+    """
+    Return a flat list of {"key": key, "value": value}
+    for the specified keys that exist in the original dict.
+    """
+    return [{"key": k, "value": d[k]} for k in keys if k in d]
 
 
 def safe_write(path: Path, content: str) -> None:
@@ -37,12 +52,20 @@ def stringify_response(resp: Any) -> str:
         return resp.model_dump_json() if hasattr(resp, "model_dump_json") else str(resp)
     except Exception:
         return str(resp)
+    
 
 
-def extract_output_text(resp: Any) -> str:
-    """Return assistant's textual output, tolerating various SDK shapes."""
-    value = getattr(resp, "output_text", "")
-    return value if isinstance(value, str) else str(value or "")
+def url_to_id(url: str) -> str:
+    parsed = urlparse(url)
+
+    netloc = parsed.netloc
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+
+    raw = netloc + parsed.path
+    raw = raw.lower()
+
+    return re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
 
 
 def write_failure(out_dir: Path, pdf_name: str, e: Exception) -> None:

@@ -10,6 +10,7 @@ embeddings
 .DS_Store
 Thumbs.db
 .idea
+.vscode
 
 # hard assets
 intervention_graph_creation/data/**/*.pdf

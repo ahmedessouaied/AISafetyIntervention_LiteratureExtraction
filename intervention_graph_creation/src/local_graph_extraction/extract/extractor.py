@@ -1,4 +1,5 @@
 import os
+import re
 import json
 from pathlib import Path
 from typing import Any, Optional
@@ -13,13 +14,17 @@ from intervention_graph_creation.src.local_graph_extraction.extract.utilities im
                                                                                       split_text_and_json,
                                                                                       stringify_response,
                                                                                       extract_output_text,
-                                                                                      write_failure)
+                                                                                      write_failure,
+                                                                                      url_to_id,
+                                                                                      filter_dict)
 
 # ---------------- Basic config ----------------
 
-MODEL = "gpt-5-2025-08-07"
-REASONING_EFFORT = "minimal"
+
+MODEL = "o3"
+REASONING_EFFORT = "medium"
 SETTINGS = load_settings()
+META_KEYS = frozenset(['authors', 'date_published', 'filename', 'source', 'source_filetype', 'title', 'url'])
 
 
 class Extractor:
@@ -46,7 +51,7 @@ class Extractor:
         except Exception as e:
             raise RuntimeError(f"Failed to upload to OpenAI: {e}") from e
 
-    def call_openai(self, file_id: str) -> Any:
+    def call_openai_file(self, file_id: str) -> Any:
         """Call the model with the file id and return the raw response."""
         messages = [{
             "role": "user",
@@ -64,8 +69,27 @@ class Extractor:
         except Exception as e:
             # One simple standard type for API-level failures
             raise RuntimeError(f"OpenAI API call failed: {e}") from e
+        
+    def call_openai_text(self, file_text: str) -> Any:
+        """Call the model with the file text and return the raw response."""
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": PROMPT_EXTRACT},
+                {"type": "input_text", "text": f"\n\nHere is the paper for analysis:\n\n{file_text}"},
+            ],
+        }]
+        try:
+            return self.client.responses.parse(
+                model=MODEL,
+                input=messages,
+                reasoning={"effort": REASONING_EFFORT},
+            )
+        except Exception as e:
+            # One simple standard type for API-level failures
+            raise RuntimeError(f"OpenAI API call failed: {e}") from e
 
-    def write_outputs(self, out_dir: Path, stem: str, resp: Any) -> None:
+    def write_outputs(self, out_dir: Path, stem: str, resp: Any, meta: json) -> None:
         """Write raw response, summary text, and parsed JSON (or raise)."""
         raw_path = out_dir / f"{stem}_raw_response.txt"
         json_path = out_dir / f"{stem}.json"
@@ -82,32 +106,75 @@ class Extractor:
             raise ValueError("No JSON block found in output_text")
 
         parsed = json.loads(json_part)
+
+        if meta:
+            parsed['meta'] = meta
+
         safe_write(json_path, json.dumps(parsed, ensure_ascii=False, indent=2))
 
-    def process_pdf(self, pdf_path: Path) -> None:
-        """End-to-end processing of a single PDF. Exceptions bubble up."""
-        out_dir = SETTINGS.paths.output_dir / pdf_path.stem
+    def process_pdf(self, path: Path) -> None:
+        """Process a single PDF."""
+        out_dir = SETTINGS.paths.output_dir / path.stem
         if out_dir.exists():
             return
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        file_id = self.upload_pdf_get_id(pdf_path)
-        resp = self.call_openai(file_id)
-        self.write_outputs(out_dir, pdf_path.stem, resp)
+        file_id = self.upload_pdf_get_id(path)
+        resp = self.call_openai_file(file_id)
+        meta = [{"key": "filename", "value": path.name}] # other meta?
+
+        self.write_outputs(out_dir, path.stem, resp, meta)
+
+    def process_jsonl(self, path: Path) -> None:
+        """Process a single JSONL file."""
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    paper_json = json.loads(line)
+
+                    paper_id = path.stem + "__" + url_to_id(paper_json.get('url', 'unknown'))
+                
+                    out_dir = SETTINGS.paths.output_dir / paper_id
+                    if out_dir.exists():
+                        return
+                    out_dir.mkdir(parents=True, exist_ok=True)
+
+                    resp = self.call_openai_text(paper_json['text'])
+                    meta = filter_dict(paper_json, META_KEYS)
+
+                    self.write_outputs(out_dir, paper_id, resp, meta)
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to read JSON file '{path}': {e}") from e
 
     def process_dir(self, input_dir: Path, first_n: Optional[int] = None) -> None:
-        """Process *.pdf in a directory. Single catch-all per file for diagnostics."""
+        """Process all files in a directory. Single catch-all per file for diagnostics."""
         SETTINGS.paths.output_dir.mkdir(parents=True, exist_ok=True)
-        pdfs = sorted(input_dir.absolute().glob("*.pdf"))
-        if first_n:
-            pdfs = pdfs[:first_n]
 
-        for pdf in tqdm(pdfs):
-            out_dir = SETTINGS.paths.output_dir / pdf.stem
-            try:
-                self.process_pdf(pdf)
-            except Exception as e:
-                write_failure(out_dir, pdf.name, e)
+        files = []
+        for ext in ('*.pdf', '*.jsonl'):
+            files.extend(input_dir.glob(ext))
+
+        if first_n:
+            files = files[:first_n]
+
+        print(f"Found {len(files)} files in {input_dir} to process.")
+        print(files)
+
+        for file in tqdm(files):
+            if file.suffix.lower() == '.jsonl':
+                try:
+                    self.process_jsonl(file)
+                except Exception as e:
+                    write_failure(SETTINGS.paths.output_dir, file.stem, e)
+                continue
+            elif file.suffix.lower() == '.pdf':
+                try:
+                    self.process_pdf(file)
+                except Exception as e:
+                    write_failure(SETTINGS.paths.output_dir, file.stem, e)
+                continue
 
 
 if __name__ == "__main__":
