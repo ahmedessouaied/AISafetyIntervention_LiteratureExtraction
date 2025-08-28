@@ -6,8 +6,9 @@ from tqdm import tqdm
 from typing import List, Dict, Any
 
 from config import load_settings
-from intervention_graph_creation.src.local_graph_extraction.core import Node, Edge, PaperSchema
-from intervention_graph_creation.src.local_graph_extraction.db.helpers import label_for, lit
+from intervention_graph_creation.src.local_graph_extraction.core import PaperSchema
+from intervention_graph_creation.src.local_graph_extraction.local_graph import GraphNode, GraphEdge, LocalGraph
+from intervention_graph_creation.src.local_graph_extraction.db.helpers import label_for, lit, vector_to_string
 
 
 SETTINGS = load_settings()
@@ -19,9 +20,12 @@ class AISafetyGraph:
 
     # ---------- nodes ----------
 
-    def upsert_node(self, node: Node, paper_id: str) -> None:
+    def upsert_node(self, node: GraphNode, paper_id: str) -> None:
         g = self.db.select_graph(SETTINGS.falkordb.graph)
         label = label_for(node.type)
+
+        embedding_list = node.embedding.tolist() if node.embedding is not None else None
+
         # Uniqueness by (name, type) → prevents duplicates for same typed name
         g.query(
             f"MERGE (n:{label} {{name: {lit(node.name)}, type: {lit(node.type)}}}) "
@@ -30,7 +34,8 @@ class AISafetyGraph:
             f"n.concept_category = {lit(node.concept_category)}, "
             f"n.intervention_lifecycle = {lit(node.intervention_lifecycle)}, "
             f"n.intervention_maturity = {lit(node.intervention_maturity)}, "
-            f"n.paper_id = {lit(paper_id)} "
+            f"n.paper_id = {lit(paper_id)}, "
+            f"n.embedding = vecf32({embedding_list})"
             f"RETURN n"
         )
 
@@ -38,11 +43,13 @@ class AISafetyGraph:
     # Multiple edges between same nodes are allowed,
     # but for the same etype we update the existing edge (MERGE by etype).
 
-    def upsert_edge(self, edge: Edge, paper_id: str) -> None:
+    def upsert_edge(self, edge: GraphEdge, paper_id: str) -> None:
         g = self.db.select_graph(SETTINGS.falkordb.graph)
         s = lit(edge.source_node)
         t = lit(edge.target_node)
         etype = lit(edge.type)
+
+        embedding_list = edge.embedding.tolist() if edge.embedding is not None else None
 
         # Ensure endpoints exist (by name only; labels may be added elsewhere)
         g.query(f"MERGE (a {{name: {s}}}) RETURN a")
@@ -50,12 +57,13 @@ class AISafetyGraph:
 
         # One :EDGE per (a,b,etype). If exists → update props; else → create.
         g.query(
-            "MATCH (a {name: " + s + "}), (b {name: " + t + "}) "
-            "MERGE (a)-[r:EDGE {etype: " + etype + "}]->(b) "
-            "SET r.description = " + lit(edge.description) + ", "
-            "    r.edge_confidence = " + lit(edge.edge_confidence) + ", "
-            "    r.paper_id = " + lit(paper_id) + " "
-            "RETURN r"
+            f"MATCH (a {{name: {s}}}), (b {{name: {t}}}) "
+            f"MERGE (a)-[r:EDGE {{etype: {etype}}}]->(b) "
+            f"SET r.description = {lit(edge.description)}, "
+            f"r.edge_confidence = {lit(edge.edge_confidence)}, "
+            f"r.paper_id = {lit(paper_id)}, "
+            f"r.embedding = vecf32({embedding_list}) "
+            f"RETURN r"
         )
 
     # ---------- ingest ----------
@@ -84,13 +92,12 @@ class AISafetyGraph:
                 errs.append(f"Edges reference unknown nodes: {missing[:5]}...")
             errors[json_path.stem] = errs
 
-        paper_id = json_path.stem
-        for n in doc.nodes:
-            self.upsert_node(n, paper_id)
-        for ch in doc.logical_chains:
-            for e in ch.edges:
-                if e.source_node in known and e.target_node in known:
-                    self.upsert_edge(e, paper_id)
+        local_graph = LocalGraph.from_paper_schema(doc, json_path)
+        for node in local_graph.nodes:
+            local_graph.add_embeddings_to_nodes(node)
+        for edge in local_graph.edges:
+            local_graph.add_embeddings_to_edges(edge)
+        self.ingest_local_graph(local_graph)
 
         return has_issue
 
@@ -120,6 +127,12 @@ class AISafetyGraph:
             print("\n=== Files with issues ===")
             for k, v in errors.items():
                 print(f"- {k}.json: {', '.join(v)}")
+
+    def ingest_local_graph(self, local_graph: LocalGraph) -> None:
+        for node in local_graph.nodes:
+            self.upsert_node(node, local_graph.paper_id)
+        for edge in local_graph.edges:
+            self.upsert_edge(edge, local_graph.paper_id)
 
     # ---------- utils ----------
 

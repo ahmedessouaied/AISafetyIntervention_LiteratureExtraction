@@ -88,14 +88,24 @@ class Meta(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    @field_validator("key", "value")
+    @field_validator("key", "value", mode="before")
     @classmethod
-    def _strip_value_if_str(cls, v):
+    def _strip_nonempty(cls, v):
         if isinstance(v, str):
             v2 = v.strip()
             if not v2:
                 raise ValueError("must be non-empty")
             return v2
+        elif isinstance(v, list):
+            new_list = []
+            for item in v:
+                if not isinstance(item, str):
+                    raise ValueError("all items must be strings")
+                item2 = item.strip()
+                if not item2:
+                    raise ValueError("list items must be non-empty")
+                new_list.append(item2)
+            return new_list
         return v
 
 
