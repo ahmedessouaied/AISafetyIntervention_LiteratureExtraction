@@ -1,8 +1,9 @@
 from pathlib import Path
 import json
+import shutil
 from falkordb import FalkorDB
 from tqdm import tqdm
-from typing import List
+from typing import List, Dict, Any
 
 from config import load_settings
 from intervention_graph_creation.src.local_graph_extraction.core import Node, Edge, PaperSchema
@@ -59,16 +60,12 @@ class AISafetyGraph:
 
     # ---------- ingest ----------
 
-    def ingest_file(self, json_path: Path) -> None:
+    def ingest_file(self, json_path: Path, errors: dict) -> bool:
         data = json.loads(Path(json_path).read_text(encoding="utf-8"))
         doc = PaperSchema(**data)
 
-        # Basic file-level checks
         names = [n.name for n in doc.nodes]
-        if len(names) != len(set(names)):
-            dupes = sorted({x for x in names if names.count(x) > 1})
-            raise ValueError(f"Duplicate node names in {json_path.name}: {dupes}")
-
+        dupes = sorted({x for x in names if names.count(x) > 1})
         known = set(names)
         missing = [
             (e.source_node, e.target_node)
@@ -76,42 +73,69 @@ class AISafetyGraph:
             for e in ch.edges
             if e.source_node not in known or e.target_node not in known
         ]
-        if missing:
-            raise ValueError(f"Edges reference unknown nodes in {json_path.name}: {missing[:5]}...")
+
+        has_issue = False
+        if dupes or missing:
+            has_issue = True
+            errs = []
+            if dupes:
+                errs.append(f"Duplicate node names: {dupes}")
+            if missing:
+                errs.append(f"Edges reference unknown nodes: {missing[:5]}...")
+            errors[json_path.stem] = errs
 
         paper_id = json_path.stem
-
         for n in doc.nodes:
             self.upsert_node(n, paper_id)
-
         for ch in doc.logical_chains:
             for e in ch.edges:
-                self.upsert_edge(e, paper_id)
+                if e.source_node in known and e.target_node in known:
+                    self.upsert_edge(e, paper_id)
+
+        return has_issue
 
     def ingest_dir(self, input_dir: Path = SETTINGS.paths.output_dir) -> None:
+        errors = {}
         base = Path(input_dir)
+        issues_dir = base / "issues"
+        issues_dir.mkdir(exist_ok=True)
         subdirs = [d for d in base.iterdir() if d.is_dir()]
+
         for d in tqdm(sorted(subdirs)):
             json_path = d / f"{d.name}.json"
             if not json_path.exists():
                 print(f"⚠️ Skipping {d.name}: {json_path} not found")
                 continue
-            self.ingest_file(json_path)
+
+            has_issue = self.ingest_file(json_path, errors)
+            if has_issue:
+                target_dir = issues_dir / d.name
+                if target_dir.exists():
+                    shutil.rmtree(target_dir)
+                shutil.move(str(d), str(issues_dir))
+                err_file = target_dir / "errors.txt"
+                err_file.write_text("\n".join(errors[d.name]), encoding="utf-8")
+
+        if errors:
+            print("\n=== Files with issues ===")
+            for k, v in errors.items():
+                print(f"- {k}.json: {', '.join(v)}")
 
     # ---------- utils ----------
 
-    def get_nodes(self) -> List[dict]:
+    def get_graph(self) -> Dict[str, List[Dict[str, Any]]]:
         g = self.db.select_graph(SETTINGS.falkordb.graph)
-        res = g.ro_query("MATCH (n) RETURN ID(n) AS id, labels(n) AS labels, n AS node")
-        out = []
-        for row in res.result_set:
+
+        node_res = g.ro_query("MATCH (n) RETURN ID(n) AS id, labels(n) AS labels, n AS node")
+        nodes = []
+        for row in node_res.result_set:
             node_id = row[0]
             labels = row[1] or []
             node = row[2]
             props = node.properties or {}
             parts = []
             for k, v in props.items():
-                if k in ("id",):
+                if k == "id":
                     continue
                 if isinstance(v, str):
                     v_str = v
@@ -122,9 +146,35 @@ class AISafetyGraph:
                 if v_str:
                     parts.append(f"{k}={v_str}")
             text = "; ".join(parts) if parts else ""
-            if text:
-                out.append({"id": node_id, "labels": labels, "text": text})
-        return out
+            nodes.append({"id": node_id, "labels": labels, "text": text})
+
+        edge_res = g.ro_query(
+            "MATCH (n)-[r]->(m) RETURN ID(r) AS id, TYPE(r) AS type, ID(n) AS source, ID(m) AS target, r AS rel"
+        )
+        edges = []
+        for row in edge_res.result_set:
+            edge_id = row[0]
+            edge_type = row[1]
+            source = row[2]
+            target = row[3]
+            rel = row[4]
+            props = rel.properties or {}
+            edges.append(
+                {
+                    "id": edge_id,
+                    "type": edge_type,
+                    "source": source,
+                    "target": target,
+                    "properties": props,
+                }
+            )
+
+        return {"nodes": nodes, "edges": edges}
+
+    def save_graph_to_json(self, filepath: str) -> None:
+        data = self.get_graph()
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
 
     def merge_nodes(self, keep_name: str, remove_name: str):
         """
@@ -173,7 +223,9 @@ class AISafetyGraph:
 
 
 def main():
-    AISafetyGraph().ingest_dir(SETTINGS.paths.output_dir)
+    graph = AISafetyGraph()
+    graph.ingest_dir(SETTINGS.paths.output_dir)
+    graph.save_graph_to_json("graph.json")
 
 
 if __name__ == "__main__":
