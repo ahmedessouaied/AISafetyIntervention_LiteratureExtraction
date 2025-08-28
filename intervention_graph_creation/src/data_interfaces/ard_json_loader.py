@@ -135,6 +135,7 @@ def load_publications_from_hf_ard(
 def main():
     publications = load_publications_from_hf_ard(
         repo_id="StampyAI/alignment-research-dataset",
+        allow_patterns=["arxiv/*"],
         local_dir=str(SETTINGS.paths.input_dir),
         dedupe=True
     )

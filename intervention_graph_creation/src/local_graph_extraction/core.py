@@ -1,4 +1,4 @@
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Union
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 
@@ -84,17 +84,19 @@ class Edge(BaseModel):
 
 class Meta(BaseModel):
     key: str = Field(min_length=1, max_length=64, description="metadata key")
-    value: str = Field(min_length=1, max_length=256, description="metadata value")
+    value: Union[str, List[str]] = Field(min_length=1, max_length=256, description="metadata value")
 
     model_config = ConfigDict(extra="forbid")
 
     @field_validator("key", "value")
     @classmethod
-    def _strip_nonempty(cls, v: str) -> str:
-        v2 = v.strip()
-        if not v2:
-            raise ValueError("must be non-empty")
-        return v2
+    def _strip_value_if_str(cls, v):
+        if isinstance(v, str):
+            v2 = v.strip()
+            if not v2:
+                raise ValueError("must be non-empty")
+            return v2
+        return v
 
 
 class LogicalChain(BaseModel):
