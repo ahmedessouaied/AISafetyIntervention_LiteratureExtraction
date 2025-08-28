@@ -54,7 +54,6 @@ def stringify_response(resp: Any) -> str:
         return str(resp)
     
 
-
 def url_to_id(url: str) -> str:
     parsed = urlparse(url)
 

@@ -6,10 +6,11 @@ from tqdm import tqdm
 from typing import List, Dict, Any
 
 from config import load_settings
-from intervention_graph_creation.src.local_graph_extraction.core import PaperSchema
-from intervention_graph_creation.src.local_graph_extraction.local_graph import GraphNode, GraphEdge, LocalGraph
-from intervention_graph_creation.src.local_graph_extraction.db.helpers import label_for, lit, vector_to_string
-
+from intervention_graph_creation.src.local_graph_extraction.core.paper_schema import PaperSchema
+from intervention_graph_creation.src.local_graph_extraction.core.local_graph import LocalGraph
+from intervention_graph_creation.src.local_graph_extraction.core.edge import GraphEdge
+from intervention_graph_creation.src.local_graph_extraction.core.node import GraphNode
+from intervention_graph_creation.src.local_graph_extraction.db.helpers import label_for, lit
 
 SETTINGS = load_settings()
 

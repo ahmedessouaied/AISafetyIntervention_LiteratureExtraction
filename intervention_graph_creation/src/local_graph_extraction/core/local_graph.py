@@ -4,34 +4,9 @@ from pydantic import BaseModel, ConfigDict
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 
-from .core import Node, Edge, PaperSchema
-
-
-class GraphNode(Node):
-    """Extended Node class with embedding support."""
-    embedding: Optional[np.ndarray] = None
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    
-    def __init__(self, **data):
-        # Handle embedding separately to avoid pydantic validation issues
-        embedding = data.pop('embedding', None)
-        super().__init__(**data)
-        self.embedding = embedding
-
-
-class GraphEdge(Edge):
-    """Extended Edge class with embedding and concept metadata support."""
-    embedding: Optional[np.ndarray] = None
-    logical_chain_title: Optional[str] = None  # Equivalent to title in LogicalChain
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    
-    def __init__(self, **data):
-        # Handle embedding separately to avoid pydantic validation issues
-        embedding = data.pop('embedding', None)
-        logical_chain_title = data.pop('logical_chain_title', None)
-        super().__init__(**data)
-        self.embedding = embedding
-        self.logical_chain_title = logical_chain_title
+from intervention_graph_creation.src.local_graph_extraction.core.edge import GraphEdge
+from intervention_graph_creation.src.local_graph_extraction.core.node import GraphNode
+from intervention_graph_creation.src.local_graph_extraction.core.paper_schema import PaperSchema
 
 
 class LocalGraph(BaseModel):

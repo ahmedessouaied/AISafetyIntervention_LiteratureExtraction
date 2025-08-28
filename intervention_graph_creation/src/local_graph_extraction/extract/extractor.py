@@ -97,7 +97,6 @@ class Extractor:
         safe_write(json_path, json.dumps(parsed, ensure_ascii=False, indent=2))
 
     def _usage_from_resp(self, resp: Any):
-        # robust: пробуем разные формы usage
         try:
             usage = getattr(resp, "usage", None)
             if isinstance(usage, dict):
@@ -225,7 +224,6 @@ class Extractor:
                         if json_items_cap <= 0:
                             break
                 except Exception as e:
-                    # действительно фатальная ошибка уровня файла
                     write_failure(SETTINGS.paths.output_dir, file.stem, e)
 
         if self._n:
