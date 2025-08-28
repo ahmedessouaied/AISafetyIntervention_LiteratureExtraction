@@ -5,9 +5,11 @@ import logging
 import os
 from typing import List, Optional
 
-from .dedupe import dedupe_publications
-from .models import Publication
+from intervention_graph_creation.src.data_interfaces.dedupe import dedupe_publications
+from intervention_graph_creation.src.data_interfaces.models import Publication
+from config import load_settings
 
+SETTINGS = load_settings()
 logger = logging.getLogger(__name__)
 
 
@@ -128,3 +130,26 @@ def load_publications_from_hf_ard(
     if dedupe:
         publications = dedupe_publications(publications, prefer="latest_date")
     return publications
+
+
+def main():
+    publications = load_publications_from_hf_ard(
+        repo_id="StampyAI/alignment-research-dataset",
+        allow_patterns=["arxiv/*"],
+        local_dir=str(SETTINGS.paths.input_dir),
+        dedupe=True
+    )
+
+    print(f"Downloaded publications: {len(publications)}\n")
+
+    for pub in publications[:3]:
+        print("=" * 80)
+        print(f"Title: {pub.title}")
+        print(f"Authors: {', '.join(pub.authors)}")
+        print(f"Date: {pub.date_published}")
+        print(f"URL: {pub.url}")
+        print(f"Text (first 200 chars): {pub.text[:200]!r}\n")
+
+
+if __name__ == "__main__":
+    main()

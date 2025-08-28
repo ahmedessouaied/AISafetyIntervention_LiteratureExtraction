@@ -13,9 +13,10 @@ Thumbs.db
 .vscode
 
 # hard assets
-data/**/*.pdf
-data/**/*.json
-data/**/*.jsonl
+local
+intervention_graph_creation/data/**/*.pdf
+intervention_graph_creation/data/**/*.json
+intervention_graph_creation/data/**/*.jsonl
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

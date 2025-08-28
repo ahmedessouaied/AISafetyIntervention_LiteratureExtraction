@@ -54,7 +54,6 @@ def stringify_response(resp: Any) -> str:
         return str(resp)
     
 
-
 def url_to_id(url: str) -> str:
     parsed = urlparse(url)
 
@@ -70,8 +69,9 @@ def url_to_id(url: str) -> str:
 
 def write_failure(out_dir: Path, pdf_name: str, e: Exception) -> None:
     """Uniformly persist failure diagnostics for a single PDF."""
-    out_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(pdf_name).stem
+    out_dir = out_dir / "error" / stem
+    out_dir.mkdir(parents=True, exist_ok=True)
     raw_path = out_dir / f"{stem}_raw_response.txt"
     json_path = out_dir / f"{stem}.json"
     summary_path = out_dir / f"{stem}_summary.txt"
@@ -79,8 +79,9 @@ def write_failure(out_dir: Path, pdf_name: str, e: Exception) -> None:
     diag = (
         f"Processing failed for {pdf_name}\n"
         f"{type(e).__name__}: {e}\n\n"
-        f"Traceback:\n{traceback.format_exc()}"
     )
+    print(diag)
+    diag += f"Traceback:\n{traceback.format_exc()}"
     safe_write(raw_path, diag)
     safe_write(summary_path, "")
     safe_write(json_path, json.dumps(
