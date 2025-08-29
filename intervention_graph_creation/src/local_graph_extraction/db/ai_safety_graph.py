@@ -97,16 +97,12 @@ class AISafetyGraph:
     # ---------- indexes ----------
 
     def set_index(self) -> None:
-        """
-        Drops the vector index on (n:Node).embedding if it exists, then creates a new one. Only call at the end of all data ingest.
-        """
         g = self.db.select_graph(SETTINGS.falkordb.graph)
 
         # Check for existing vector index on (n:Node).embedding
         result = g.ro_query("CALL db.indexes()")
         index_exists = False
         for row in result.result_set:
-            # Look for a vector index on :Node(embedding)
             if (
                 (len(row) >= 3)
                 and ("Node" in str(row[0]))
@@ -125,11 +121,10 @@ class AISafetyGraph:
         g.query("CREATE VECTOR INDEX FOR (n:Node) ON (n.embedding) OPTIONS {dimension:1024, similarityFunction:'cosine'}")
         print("Created vector index on (n:Node).embedding.")
 
-        # Check for existing vector index on (r:EDGE).embedding
+        # Check for existing vector index on [r:EDGE].embedding
         result = g.ro_query("CALL db.indexes()")
         edge_index_exists = False
         for row in result.result_set:
-            # Look for a vector index on :EDGE(embedding)
             if (
                 (len(row) >= 3)
                 and ("EDGE" in str(row[0]))
