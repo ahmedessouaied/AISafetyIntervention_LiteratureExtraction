@@ -48,7 +48,7 @@ class LocalGraph(BaseModel):
         graph_edges = []
         for logical_chain in paper_schema.logical_chains:
             for edge in logical_chain.edges:
-                graph_edge = GraphEdge(**edge.model_dump(), logical_chain_title=logical_chain.title)
+                graph_edge = GraphEdge(**edge.model_dump())
                 graph_edges.append(graph_edge)
         local_graph = LocalGraph(nodes=graph_nodes, edges=graph_edges, paper_id=json_path.stem)
         return local_graph

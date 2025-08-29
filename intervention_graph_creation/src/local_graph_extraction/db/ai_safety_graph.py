@@ -23,22 +23,40 @@ class AISafetyGraph:
 
     def upsert_node(self, node: GraphNode, paper_id: str) -> None:
         g = self.db.select_graph(SETTINGS.falkordb.graph)
-        label = label_for(node.type)
+        base_label = label_for(node.type)            # "Concept" or "Intervention"
+        generic_label = "Node"
 
-        embedding_list = node.embedding.tolist() if node.embedding is not None else None
+        # Prepare params
+        params = {
+            "name": lit(node.name),
+            "type": lit(node.type),
+            "description": lit(node.description),
+            "aliases": lit(node.aliases),
+            "concept_category": lit(node.concept_category),
+            "intervention_lifecycle": lit(node.intervention_lifecycle),
+            "intervention_maturity": lit(node.intervention_maturity),
+            "paper_id": lit(paper_id),
+            "embedding": (node.embedding.tolist() if node.embedding is not None else None),
+        }
 
-        # Uniqueness by (name, type) → prevents duplicates for same typed name
-        g.query(
-            f"MERGE (n:{label} {{name: {lit(node.name)}, type: {lit(node.type)}}}) "
-            f"SET n.description = {lit(node.description)}, "
-            f"n.aliases = {lit(node.aliases)}, "
-            f"n.concept_category = {lit(node.concept_category)}, "
-            f"n.intervention_lifecycle = {lit(node.intervention_lifecycle)}, "
-            f"n.intervention_maturity = {lit(node.intervention_maturity)}, "
-            f"n.paper_id = {lit(paper_id)}, "
-            f"n.embedding = vecf32({embedding_list})"
-            f"RETURN n"
-        )
+        # - MERGE uses ONLY the base label so existing nodes (without :Node) still match.
+        # - We add :Node after MERGE via SET n:Node.
+        # - For embedding, we conditionally set vecf32(...) only when provided; otherwise set NULL.
+        cypher = f"""
+        MERGE (n:{base_label} {{name: $name, type: $type}})
+        SET n:{generic_label},
+            n.description = $description,
+            n.aliases = $aliases,
+            n.concept_category = $concept_category,
+            n.intervention_lifecycle = $intervention_lifecycle,
+            n.intervention_maturity = $intervention_maturity,
+            n.paper_id = $paper_id
+        WITH n, $embedding AS emb
+        SET n.embedding = CASE WHEN emb IS NULL THEN NULL ELSE vecf32(emb) END
+        RETURN n
+        """
+
+        g.query(cypher, params)
 
     # ---------- edges ----------
     # Multiple edges between same nodes are allowed,
@@ -46,26 +64,36 @@ class AISafetyGraph:
 
     def upsert_edge(self, edge: GraphEdge, paper_id: str) -> None:
         g = self.db.select_graph(SETTINGS.falkordb.graph)
-        s = lit(edge.source_node)
-        t = lit(edge.target_node)
-        etype = lit(edge.type)
 
-        embedding_list = edge.embedding.tolist() if edge.embedding is not None else None
+        # Prepare params
+        params = {
+            "s": lit(edge.source_node),
+            "t": lit(edge.target_node),
+            "etype": lit(edge.type),
+            "description": lit(edge.description),
+            "edge_confidence": lit(edge.edge_confidence),
+            "paper_id": lit(paper_id),
+            "embedding": (edge.embedding.tolist() if edge.embedding is not None else None)
+        }
 
-        # Ensure endpoints exist (by name only; labels may be added elsewhere)
-        g.query(f"MERGE (a {{name: {s}}}) RETURN a")
-        g.query(f"MERGE (b {{name: {t}}}) RETURN b")
+        # Assume nodes already exist with correct labels; do not create them here.
+        # g.query(f"MERGE (a:Node {{name: {lit(edge.source_node)}}}) RETURN a")
+        # g.query(f"MERGE (b:Node {{name: {lit(edge.target_node)}}}) RETURN b")
 
         # One :EDGE per (a,b,etype). If exists → update props; else → create.
-        g.query(
-            f"MATCH (a {{name: {s}}}), (b {{name: {t}}}) "
-            f"MERGE (a)-[r:EDGE {{etype: {etype}}}]->(b) "
-            f"SET r.description = {lit(edge.description)}, "
-            f"r.edge_confidence = {lit(edge.edge_confidence)}, "
-            f"r.paper_id = {lit(paper_id)}, "
-            f"r.embedding = vecf32({embedding_list}) "
-            f"RETURN r"
-        )
+        cypher = f"""
+        MATCH (a {{name: $s}}), (b {{name: $t}})
+        MERGE (a)-[r:EDGE {{etype: $etype}}]->(b)
+        SET r.description = $description,
+            r.edge_confidence = $edge_confidence,
+            r.paper_id = $paper_id
+        WITH r, $embedding AS emb
+        SET r.embedding = CASE WHEN emb IS NULL THEN NULL ELSE vecf32(emb) END
+        RETURN r
+        """ 
+
+        g.query(cypher, params)
+
 
     # ---------- ingest ----------
 
