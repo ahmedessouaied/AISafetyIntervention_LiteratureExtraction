@@ -94,6 +94,35 @@ class AISafetyGraph:
 
         g.query(cypher, params)
 
+    # ---------- indexes ----------
+
+    def set_index(self) -> None:
+        """
+        Drops the vector index on (n:Node).embedding if it exists, then creates a new one. Only call at the end of all data ingest.
+        """
+        g = self.db.select_graph(SETTINGS.falkordb.graph)
+        # Check for existing vector index on (n:Node).embedding
+        result = g.ro_query("CALL db.indexes()")
+        index_exists = False
+        for row in result.result_set:
+            # Look for a vector index on :Node(embedding)
+            if (
+                (len(row) >= 3)
+                and ("Node" in str(row[0]))
+                and ("embedding" in str(row[1]))
+                and ("VECTOR" in str(row[2]).upper())
+            ):
+                index_exists = True
+                break
+        if index_exists:
+            print("Dropping existing vector index on (n:Node).embedding...")
+            try:
+                g.query("DROP VECTOR INDEX FOR (n:Node) ON (n.embedding)")
+            except Exception as e:
+                print(f"Warning: Failed to drop vector index (may not exist or not supported): {e}")
+        print("Creating new vector index on (n:Node).embedding...")
+        g.query("CREATE VECTOR INDEX FOR (n:Node) ON (n.embedding) OPTIONS {dimension:1024, similarityFunction:'cosine'}")
+        print("Created vector index on (n:Node).embedding.")
 
     # ---------- ingest ----------
 
@@ -156,6 +185,8 @@ class AISafetyGraph:
             print("\n=== Files with issues ===")
             for k, v in errors.items():
                 print(f"- {k}.json: {', '.join(v)}")
+
+        self.set_index()
 
     def ingest_local_graph(self, local_graph: LocalGraph) -> None:
         for node in local_graph.nodes:
