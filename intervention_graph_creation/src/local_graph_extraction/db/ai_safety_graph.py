@@ -101,6 +101,7 @@ class AISafetyGraph:
         Drops the vector index on (n:Node).embedding if it exists, then creates a new one. Only call at the end of all data ingest.
         """
         g = self.db.select_graph(SETTINGS.falkordb.graph)
+
         # Check for existing vector index on (n:Node).embedding
         result = g.ro_query("CALL db.indexes()")
         index_exists = False
@@ -123,6 +124,29 @@ class AISafetyGraph:
         print("Creating new vector index on (n:Node).embedding...")
         g.query("CREATE VECTOR INDEX FOR (n:Node) ON (n.embedding) OPTIONS {dimension:1024, similarityFunction:'cosine'}")
         print("Created vector index on (n:Node).embedding.")
+
+        # Check for existing vector index on (r:EDGE).embedding
+        result = g.ro_query("CALL db.indexes()")
+        edge_index_exists = False
+        for row in result.result_set:
+            # Look for a vector index on :EDGE(embedding)
+            if (
+                (len(row) >= 3)
+                and ("EDGE" in str(row[0]))
+                and ("embedding" in str(row[1]))
+                and ("VECTOR" in str(row[2]).upper())
+            ):
+                edge_index_exists = True
+                break
+        if edge_index_exists:
+            print("Dropping existing vector index on [r:EDGE].embedding...")
+            try:
+                g.query("DROP VECTOR INDEX FOR FOR ()-[r:EDGE]-() ON (r.embedding)")
+            except Exception as e:
+                print(f"Warning: Failed to drop vector index (may not exist or not supported): {e}")
+        print("Creating new vector index on [r:EDGE].embedding...")
+        g.query("CREATE VECTOR INDEX FOR ()-[r:EDGE]-() ON (r.embedding) OPTIONS {dimension:1024, similarityFunction:'cosine'}")
+        print("Created vector index on (r:EDGE).embedding.")
 
     # ---------- ingest ----------
 
