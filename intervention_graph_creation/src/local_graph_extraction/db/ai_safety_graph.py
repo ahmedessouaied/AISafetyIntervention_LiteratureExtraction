@@ -10,7 +10,7 @@ from intervention_graph_creation.src.local_graph_extraction.core.paper_schema im
 from intervention_graph_creation.src.local_graph_extraction.core.local_graph import LocalGraph
 from intervention_graph_creation.src.local_graph_extraction.core.edge import GraphEdge
 from intervention_graph_creation.src.local_graph_extraction.core.node import GraphNode
-from intervention_graph_creation.src.local_graph_extraction.db.helpers import label_for, lit
+from intervention_graph_creation.src.local_graph_extraction.db.helpers import label_for
 
 SETTINGS = load_settings()
 
@@ -24,23 +24,23 @@ class AISafetyGraph:
     def upsert_node(self, node: GraphNode, paper_id: str) -> None:
         g = self.db.select_graph(SETTINGS.falkordb.graph)
         base_label = label_for(node.type)            # "Concept" or "Intervention"
-        generic_label = "Node"
+        generic_label = "NODE"
 
         # Prepare params
         params = {
-            "name": lit(node.name),
-            "type": lit(node.type),
-            "description": lit(node.description),
-            "aliases": lit(node.aliases),
-            "concept_category": lit(node.concept_category),
-            "intervention_lifecycle": lit(node.intervention_lifecycle),
-            "intervention_maturity": lit(node.intervention_maturity),
-            "paper_id": lit(paper_id),
+            "name": node.name,
+            "type": node.type,
+            "description": node.description,
+            "aliases": node.aliases,
+            "concept_category": node.concept_category,
+            "intervention_lifecycle": node.intervention_lifecycle,
+            "intervention_maturity": node.intervention_maturity,
+            "paper_id": paper_id,
             "embedding": (node.embedding.tolist() if node.embedding is not None else None),
         }
 
-        # - MERGE uses ONLY the base label so existing nodes (without :Node) still match.
-        # - We add :Node after MERGE via SET n:Node.
+        # - MERGE uses ONLY the base label so existing nodes (without :NODE) still match.
+        # - We add :NODE after MERGE via SET n:NODE.
         # - For embedding, we conditionally set vecf32(...) only when provided; otherwise set NULL.
         cypher = f"""
         MERGE (n:{base_label} {{name: $name, type: $type}})
@@ -67,19 +67,16 @@ class AISafetyGraph:
 
         # Prepare params
         params = {
-            "s": lit(edge.source_node),
-            "t": lit(edge.target_node),
-            "etype": lit(edge.type),
-            "description": lit(edge.description),
-            "edge_confidence": lit(edge.edge_confidence),
-            "paper_id": lit(paper_id),
+            "s": edge.source_node,
+            "t": edge.target_node,
+            "etype": edge.type,
+            "description": edge.description,
+            "edge_confidence": edge.edge_confidence,
+            "paper_id": paper_id,
             "embedding": (edge.embedding.tolist() if edge.embedding is not None else None)
         }
 
         # Assume nodes already exist with correct labels; do not create them here.
-        # g.query(f"MERGE (a:Node {{name: {lit(edge.source_node)}}}) RETURN a")
-        # g.query(f"MERGE (b:Node {{name: {lit(edge.target_node)}}}) RETURN b")
-
         # One :EDGE per (a,b,etype). If exists → update props; else → create.
         cypher = f"""
         MATCH (a {{name: $s}}), (b {{name: $t}})
@@ -99,27 +96,28 @@ class AISafetyGraph:
     def set_index(self) -> None:
         g = self.db.select_graph(SETTINGS.falkordb.graph)
 
-        # Check for existing vector index on (n:Node).embedding
+        # Check for existing vector index on (n:NODE).embedding
         result = g.ro_query("CALL db.indexes()")
         index_exists = False
         for row in result.result_set:
             if (
                 (len(row) >= 3)
-                and ("Node" in str(row[0]))
+                and ("NODE" in str(row[0]))
                 and ("embedding" in str(row[1]))
                 and ("VECTOR" in str(row[2]).upper())
             ):
                 index_exists = True
                 break
         if index_exists:
-            print("Dropping existing vector index on (n:Node).embedding...")
+            print("Dropping existing vector index on (n:NODE).embedding...")
             try:
-                g.query("DROP VECTOR INDEX FOR (n:Node) ON (n.embedding)")
+                g.query("DROP VECTOR INDEX FOR (n:NODE) ON (n.embedding)")
             except Exception as e:
                 print(f"Warning: Failed to drop vector index (may not exist or not supported): {e}")
-        print("Creating new vector index on (n:Node).embedding...")
-        g.query("CREATE VECTOR INDEX FOR (n:Node) ON (n.embedding) OPTIONS {dimension:1024, similarityFunction:'cosine'}")
-        print("Created vector index on (n:Node).embedding.")
+                
+        print("Creating new vector index on (n:NODE).embedding...")
+        g.query("CREATE VECTOR INDEX FOR (n:NODE) ON (n.embedding) OPTIONS {dimension:1024, similarityFunction:'cosine'}")
+        print("Created vector index on (n:NODE).embedding.")
 
         # Check for existing vector index on [r:EDGE].embedding
         result = g.ro_query("CALL db.indexes()")
@@ -275,30 +273,37 @@ class AISafetyGraph:
         """
         graph = self.db.select_graph(SETTINGS.falkordb.graph)
 
-        q = f"""
-        MATCH (n {{name: {lit(remove_name)}}})
+        # 1) Discover all relationship types touching the node to be removed (parameterized)
+        rel_types_q = """
+        MATCH (n {name: $remove})
         OPTIONAL MATCH (n)-[r]->() RETURN DISTINCT type(r) AS t
         UNION
-        MATCH (n {{name: {lit(remove_name)}}})
+        MATCH (n {name: $remove})
         OPTIONAL MATCH ()-[r]->(n) RETURN DISTINCT type(r) AS t
         """
-        result = graph.query(q)
-        rel_types = [r[0] for r in result.result_set if r[0] is not None]
+        res = graph.query(rel_types_q, {"remove": remove_name})
+        rel_types = [row[0] for row in res.result_set if row[0]]
 
+        # If no relationships, just delete the node (parameterized)
         if not rel_types:
-            return graph.query(f"MATCH (a {{name: {lit(remove_name)}}}) DELETE a")
+            return graph.query("MATCH (a {name: $remove}) DELETE a", {"remove": remove_name})
 
+        # 2) Build the merge query dynamically with the discovered relationship types.
+        #    NOTE: relationship *types* cannot be parameterized in Cypher.
         parts = []
         for rtype in rel_types:
             parts.append(f"""
-            OPTIONAL MATCH (a {{name: {lit(remove_name)}}})-[r:{rtype}]->(m)
-            MATCH (b {{name: {lit(keep_name)}}})
+            // Move outgoing :{rtype}
+            OPTIONAL MATCH (a {{name: $remove}})-[r:{rtype}]->(m)
+            MATCH (b {{name: $keep}})
             FOREACH (_ IN CASE WHEN m IS NULL THEN [] ELSE [1] END |
                 MERGE (b)-[r2:{rtype}]->(m)
                 SET r2 += r
             )
             WITH a, b
-            OPTIONAL MATCH (m2)-[s:{rtype}]->(a {{name: {lit(remove_name)}}})
+
+            // Move incoming :{rtype}
+            OPTIONAL MATCH (m2)-[s:{rtype}]->(a {{name: $remove}})
             FOREACH (_ IN CASE WHEN m2 IS NULL THEN [] ELSE [1] END |
                 MERGE (m2)-[s2:{rtype}]->(b)
                 SET s2 += s
@@ -306,13 +311,14 @@ class AISafetyGraph:
             WITH a, b
             """)
 
-        merge_query = f"""
-        MATCH (a {{name: {lit(remove_name)}}}), (b {{name: {lit(keep_name)}}})
+        merge_q = f"""
+        MATCH (a {{name: $remove}}), (b {{name: $keep}})
         {"".join(parts)}
         DELETE a
         """
-        return graph.query(merge_query)
 
+        return graph.query(merge_q, {"remove": remove_name, "keep": keep_name})
+    
 
 def main():
     graph = AISafetyGraph()
