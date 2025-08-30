@@ -134,7 +134,7 @@ class AISafetyGraph:
         if edge_index_exists:
             print("Dropping existing vector index on [r:EDGE].embedding...")
             try:
-                g.query("DROP VECTOR INDEX FOR FOR ()-[r:EDGE]-() ON (r.embedding)")
+                g.query("DROP VECTOR INDEX FOR ()-[r:EDGE]-() ON (r.embedding)")
             except Exception as e:
                 print(f"Warning: Failed to drop vector index (may not exist or not supported): {e}")
         print("Creating new vector index on [r:EDGE].embedding...")
@@ -147,34 +147,18 @@ class AISafetyGraph:
         data = json.loads(Path(json_path).read_text(encoding="utf-8"))
         doc = PaperSchema(**data)
 
-        names = [n.name for n in doc.nodes]
-        dupes = sorted({x for x in names if names.count(x) > 1})
-        known = set(names)
-        missing = [
-            (e.source_node, e.target_node)
-            for ch in doc.logical_chains
-            for e in ch.edges
-            if e.source_node not in known or e.target_node not in known
-        ]
-
-        has_issue = False
-        if dupes or missing:
-            has_issue = True
-            errs = []
-            if dupes:
-                errs.append(f"Duplicate node names: {dupes}")
-            if missing:
-                errs.append(f"Edges reference unknown nodes: {missing[:5]}...")
-            errors[json_path.stem] = errs
-
-        local_graph = LocalGraph.from_paper_schema(doc, json_path)
+        local_graph, error_msg = LocalGraph.from_paper_schema(doc, json_path)
+        if local_graph is None:
+            # Error already logged by from_paper_schema
+            errors[json_path.stem] = [error_msg] if error_msg else ["Invalid paper: see error log for details."]
+            return True
         for node in local_graph.nodes:
             local_graph.add_embeddings_to_nodes(node)
         for edge in local_graph.edges:
             local_graph.add_embeddings_to_edges(edge)
         self.ingest_local_graph(local_graph)
 
-        return has_issue
+        return False
 
     def ingest_dir(self, input_dir: Path = SETTINGS.paths.output_dir) -> None:
         errors = {}
@@ -184,6 +168,8 @@ class AISafetyGraph:
         subdirs = [d for d in base.iterdir() if d.is_dir()]
 
         for d in tqdm(sorted(subdirs)):
+            if d.name == "issues":
+                continue  # Skip the issues directory itself
             json_path = d / f"{d.name}.json"
             if not json_path.exists():
                 print(f"⚠️ Skipping {d.name}: {json_path} not found")
@@ -195,10 +181,12 @@ class AISafetyGraph:
                 if target_dir.exists():
                     shutil.rmtree(target_dir)
                 shutil.move(str(d), str(issues_dir))
-                err_file = target_dir / "errors.txt"
-                err_file.write_text("\n".join(errors[d.name]), encoding="utf-8")
 
+        # Write all errors to issues/issues.json
         if errors:
+            issues_json_path = issues_dir / "issues.json"
+            with open(issues_json_path, "w", encoding="utf-8") as f:
+                json.dump(errors, f, ensure_ascii=False, indent=2)
             print("\n=== Files with issues ===")
             for k, v in errors.items():
                 print(f"- {k}.json: {', '.join(v)}")
