@@ -10,7 +10,7 @@ from intervention_graph_creation.src.local_graph_extraction.core.paper_schema im
 from intervention_graph_creation.src.local_graph_extraction.core.local_graph import LocalGraph
 from intervention_graph_creation.src.local_graph_extraction.core.edge import GraphEdge
 from intervention_graph_creation.src.local_graph_extraction.core.node import GraphNode
-from intervention_graph_creation.src.local_graph_extraction.db.helpers import label_for, lit
+from intervention_graph_creation.src.local_graph_extraction.db.helpers import label_for
 
 SETTINGS = load_settings()
 
@@ -23,22 +23,40 @@ class AISafetyGraph:
 
     def upsert_node(self, node: GraphNode, paper_id: str) -> None:
         g = self.db.select_graph(SETTINGS.falkordb.graph)
-        label = label_for(node.type)
+        base_label = label_for(node.type)            # "Concept" or "Intervention"
+        generic_label = "NODE"
 
-        embedding_list = node.embedding.tolist() if node.embedding is not None else None
+        # Prepare params
+        params = {
+            "name": node.name,
+            "type": node.type,
+            "description": node.description,
+            "aliases": node.aliases,
+            "concept_category": node.concept_category,
+            "intervention_lifecycle": node.intervention_lifecycle,
+            "intervention_maturity": node.intervention_maturity,
+            "paper_id": paper_id,
+            "embedding": (node.embedding.tolist() if node.embedding is not None else None),
+        }
 
-        # Uniqueness by (name, type) → prevents duplicates for same typed name
-        g.query(
-            f"MERGE (n:{label} {{name: {lit(node.name)}, type: {lit(node.type)}}}) "
-            f"SET n.description = {lit(node.description)}, "
-            f"n.aliases = {lit(node.aliases)}, "
-            f"n.concept_category = {lit(node.concept_category)}, "
-            f"n.intervention_lifecycle = {lit(node.intervention_lifecycle)}, "
-            f"n.intervention_maturity = {lit(node.intervention_maturity)}, "
-            f"n.paper_id = {lit(paper_id)}, "
-            f"n.embedding = vecf32({embedding_list})"
-            f"RETURN n"
-        )
+        # - MERGE uses ONLY the base label so existing nodes (without :NODE) still match.
+        # - We add :NODE after MERGE via SET n:NODE.
+        # - For embedding, we conditionally set vecf32(...) only when provided; otherwise set NULL.
+        cypher = f"""
+        MERGE (n:{base_label} {{name: $name, type: $type}})
+        SET n:{generic_label},
+            n.description = $description,
+            n.aliases = $aliases,
+            n.concept_category = $concept_category,
+            n.intervention_lifecycle = $intervention_lifecycle,
+            n.intervention_maturity = $intervention_maturity,
+            n.paper_id = $paper_id
+        WITH n, $embedding AS emb
+        SET n.embedding = CASE WHEN emb IS NULL THEN NULL ELSE vecf32(emb) END
+        RETURN n
+        """
+
+        g.query(cypher, params)
 
     # ---------- edges ----------
     # Multiple edges between same nodes are allowed,
@@ -46,26 +64,82 @@ class AISafetyGraph:
 
     def upsert_edge(self, edge: GraphEdge, paper_id: str) -> None:
         g = self.db.select_graph(SETTINGS.falkordb.graph)
-        s = lit(edge.source_node)
-        t = lit(edge.target_node)
-        etype = lit(edge.type)
 
-        embedding_list = edge.embedding.tolist() if edge.embedding is not None else None
+        # Prepare params
+        params = {
+            "s": edge.source_node,
+            "t": edge.target_node,
+            "etype": edge.type,
+            "description": edge.description,
+            "edge_confidence": edge.edge_confidence,
+            "paper_id": paper_id,
+            "embedding": (edge.embedding.tolist() if edge.embedding is not None else None)
+        }
 
-        # Ensure endpoints exist (by name only; labels may be added elsewhere)
-        g.query(f"MERGE (a {{name: {s}}}) RETURN a")
-        g.query(f"MERGE (b {{name: {t}}}) RETURN b")
-
+        # Assume nodes already exist with correct labels; do not create them here.
         # One :EDGE per (a,b,etype). If exists → update props; else → create.
-        g.query(
-            f"MATCH (a {{name: {s}}}), (b {{name: {t}}}) "
-            f"MERGE (a)-[r:EDGE {{etype: {etype}}}]->(b) "
-            f"SET r.description = {lit(edge.description)}, "
-            f"r.edge_confidence = {lit(edge.edge_confidence)}, "
-            f"r.paper_id = {lit(paper_id)}, "
-            f"r.embedding = vecf32({embedding_list}) "
-            f"RETURN r"
-        )
+        cypher = f"""
+        MATCH (a {{name: $s}}), (b {{name: $t}})
+        MERGE (a)-[r:EDGE {{etype: $etype}}]->(b)
+        SET r.description = $description,
+            r.edge_confidence = $edge_confidence,
+            r.paper_id = $paper_id
+        WITH r, $embedding AS emb
+        SET r.embedding = CASE WHEN emb IS NULL THEN NULL ELSE vecf32(emb) END
+        RETURN r
+        """ 
+
+        g.query(cypher, params)
+
+    # ---------- indexes ----------
+
+    def set_index(self) -> None:
+        g = self.db.select_graph(SETTINGS.falkordb.graph)
+
+        # Check for existing vector index on (n:NODE).embedding
+        result = g.ro_query("CALL db.indexes()")
+        index_exists = False
+        for row in result.result_set:
+            if (
+                (len(row) >= 3)
+                and ("NODE" in str(row[0]))
+                and ("embedding" in str(row[1]))
+                and ("VECTOR" in str(row[2]).upper())
+            ):
+                index_exists = True
+                break
+        if index_exists:
+            print("Dropping existing vector index on (n:NODE).embedding...")
+            try:
+                g.query("DROP VECTOR INDEX FOR (n:NODE) ON (n.embedding)")
+            except Exception as e:
+                print(f"Warning: Failed to drop vector index (may not exist or not supported): {e}")
+                
+        print("Creating new vector index on (n:NODE).embedding...")
+        g.query("CREATE VECTOR INDEX FOR (n:NODE) ON (n.embedding) OPTIONS {dimension:1024, similarityFunction:'cosine'}")
+        print("Created vector index on (n:NODE).embedding.")
+
+        # Check for existing vector index on [r:EDGE].embedding
+        result = g.ro_query("CALL db.indexes()")
+        edge_index_exists = False
+        for row in result.result_set:
+            if (
+                (len(row) >= 3)
+                and ("EDGE" in str(row[0]))
+                and ("embedding" in str(row[1]))
+                and ("VECTOR" in str(row[2]).upper())
+            ):
+                edge_index_exists = True
+                break
+        if edge_index_exists:
+            print("Dropping existing vector index on [r:EDGE].embedding...")
+            try:
+                g.query("DROP VECTOR INDEX FOR ()-[r:EDGE]-() ON (r.embedding)")
+            except Exception as e:
+                print(f"Warning: Failed to drop vector index (may not exist or not supported): {e}")
+        print("Creating new vector index on [r:EDGE].embedding...")
+        g.query("CREATE VECTOR INDEX FOR ()-[r:EDGE]-() ON (r.embedding) OPTIONS {dimension:1024, similarityFunction:'cosine'}")
+        print("Created vector index on (r:EDGE).embedding.")
 
     # ---------- ingest ----------
 
@@ -73,34 +147,18 @@ class AISafetyGraph:
         data = json.loads(Path(json_path).read_text(encoding="utf-8"))
         doc = PaperSchema(**data)
 
-        names = [n.name for n in doc.nodes]
-        dupes = sorted({x for x in names if names.count(x) > 1})
-        known = set(names)
-        missing = [
-            (e.source_node, e.target_node)
-            for ch in doc.logical_chains
-            for e in ch.edges
-            if e.source_node not in known or e.target_node not in known
-        ]
-
-        has_issue = False
-        if dupes or missing:
-            has_issue = True
-            errs = []
-            if dupes:
-                errs.append(f"Duplicate node names: {dupes}")
-            if missing:
-                errs.append(f"Edges reference unknown nodes: {missing[:5]}...")
-            errors[json_path.stem] = errs
-
-        local_graph = LocalGraph.from_paper_schema(doc, json_path)
+        local_graph, error_msg = LocalGraph.from_paper_schema(doc, json_path)
+        if local_graph is None:
+            # Error already logged by from_paper_schema
+            errors[json_path.stem] = [error_msg] if error_msg else ["Invalid paper: see error log for details."]
+            return True
         for node in local_graph.nodes:
             local_graph.add_embeddings_to_nodes(node)
         for edge in local_graph.edges:
             local_graph.add_embeddings_to_edges(edge)
         self.ingest_local_graph(local_graph)
 
-        return has_issue
+        return False
 
     def ingest_dir(self, input_dir: Path = SETTINGS.paths.output_dir) -> None:
         errors = {}
@@ -110,6 +168,8 @@ class AISafetyGraph:
         subdirs = [d for d in base.iterdir() if d.is_dir()]
 
         for d in tqdm(sorted(subdirs)):
+            if d.name == "issues":
+                continue  # Skip the issues directory itself
             json_path = d / f"{d.name}.json"
             if not json_path.exists():
                 print(f"⚠️ Skipping {d.name}: {json_path} not found")
@@ -121,13 +181,17 @@ class AISafetyGraph:
                 if target_dir.exists():
                     shutil.rmtree(target_dir)
                 shutil.move(str(d), str(issues_dir))
-                err_file = target_dir / "errors.txt"
-                err_file.write_text("\n".join(errors[d.name]), encoding="utf-8")
 
+        # Write all errors to issues/issues.json
         if errors:
+            issues_json_path = issues_dir / "issues.json"
+            with open(issues_json_path, "w", encoding="utf-8") as f:
+                json.dump(errors, f, ensure_ascii=False, indent=2)
             print("\n=== Files with issues ===")
             for k, v in errors.items():
                 print(f"- {k}.json: {', '.join(v)}")
+
+        self.set_index()
 
     def ingest_local_graph(self, local_graph: LocalGraph) -> None:
         for node in local_graph.nodes:
@@ -197,30 +261,37 @@ class AISafetyGraph:
         """
         graph = self.db.select_graph(SETTINGS.falkordb.graph)
 
-        q = f"""
-        MATCH (n {{name: {lit(remove_name)}}})
+        # 1) Discover all relationship types touching the node to be removed (parameterized)
+        rel_types_q = """
+        MATCH (n {name: $remove})
         OPTIONAL MATCH (n)-[r]->() RETURN DISTINCT type(r) AS t
         UNION
-        MATCH (n {{name: {lit(remove_name)}}})
+        MATCH (n {name: $remove})
         OPTIONAL MATCH ()-[r]->(n) RETURN DISTINCT type(r) AS t
         """
-        result = graph.query(q)
-        rel_types = [r[0] for r in result.result_set if r[0] is not None]
+        res = graph.query(rel_types_q, {"remove": remove_name})
+        rel_types = [row[0] for row in res.result_set if row[0]]
 
+        # If no relationships, just delete the node (parameterized)
         if not rel_types:
-            return graph.query(f"MATCH (a {{name: {lit(remove_name)}}}) DELETE a")
+            return graph.query("MATCH (a {name: $remove}) DELETE a", {"remove": remove_name})
 
+        # 2) Build the merge query dynamically with the discovered relationship types.
+        #    NOTE: relationship *types* cannot be parameterized in Cypher.
         parts = []
         for rtype in rel_types:
             parts.append(f"""
-            OPTIONAL MATCH (a {{name: {lit(remove_name)}}})-[r:{rtype}]->(m)
-            MATCH (b {{name: {lit(keep_name)}}})
+            // Move outgoing :{rtype}
+            OPTIONAL MATCH (a {{name: $remove}})-[r:{rtype}]->(m)
+            MATCH (b {{name: $keep}})
             FOREACH (_ IN CASE WHEN m IS NULL THEN [] ELSE [1] END |
                 MERGE (b)-[r2:{rtype}]->(m)
                 SET r2 += r
             )
             WITH a, b
-            OPTIONAL MATCH (m2)-[s:{rtype}]->(a {{name: {lit(remove_name)}}})
+
+            // Move incoming :{rtype}
+            OPTIONAL MATCH (m2)-[s:{rtype}]->(a {{name: $remove}})
             FOREACH (_ IN CASE WHEN m2 IS NULL THEN [] ELSE [1] END |
                 MERGE (m2)-[s2:{rtype}]->(b)
                 SET s2 += s
@@ -228,13 +299,14 @@ class AISafetyGraph:
             WITH a, b
             """)
 
-        merge_query = f"""
-        MATCH (a {{name: {lit(remove_name)}}}), (b {{name: {lit(keep_name)}}})
+        merge_q = f"""
+        MATCH (a {{name: $remove}}), (b {{name: $keep}})
         {"".join(parts)}
         DELETE a
         """
-        return graph.query(merge_query)
 
+        return graph.query(merge_q, {"remove": remove_name, "keep": keep_name})
+    
 
 def main():
     graph = AISafetyGraph()

@@ -23,13 +23,15 @@ class LocalGraph(BaseModel):
         return len(self.nodes) + len(self.edges)
 
     @classmethod
-    def from_paper_schema(self, paper_schema: PaperSchema, json_path: Path) -> "LocalGraph":
-        """Create a LocalGraph from a PaperSchema."""
-        # Basic file-level checks
+    def from_paper_schema(self, paper_schema: PaperSchema, json_path: Path) -> "tuple[LocalGraph | None, str | None]":
+        """Create a LocalGraph from a PaperSchema. Logs errors and returns (None, error_msg) if invalid."""
+        from intervention_graph_creation.src.local_graph_extraction.extract.utilities import write_failure
         names = [n.name for n in paper_schema.nodes]
         if len(names) != len(set(names)):
             dupes = sorted({x for x in names if names.count(x) > 1})
-            raise ValueError(f"Duplicate node names in {json_path.name}: {dupes}")
+            msg = f"Duplicate node names in {json_path.name}: {dupes}"
+            write_failure(json_path.parent, json_path.name, Exception(msg))
+            return None, msg
 
         known = set(names)
         missing = [
@@ -39,7 +41,9 @@ class LocalGraph(BaseModel):
             if e.source_node not in known or e.target_node not in known
         ]
         if missing:
-            raise ValueError(f"Edges reference unknown nodes in {json_path.name}: {missing[:5]}...")
+            msg = f"Edges reference unknown nodes in {json_path.name}: {missing[:5]}..."
+            write_failure(json_path.parent, json_path.name, Exception(msg))
+            return None, msg
 
         # Convert to LocalGraph
         graph_nodes = [GraphNode(**node.model_dump()) for node in paper_schema.nodes]
@@ -48,10 +52,10 @@ class LocalGraph(BaseModel):
         graph_edges = []
         for logical_chain in paper_schema.logical_chains:
             for edge in logical_chain.edges:
-                graph_edge = GraphEdge(**edge.model_dump(), logical_chain_title=logical_chain.title)
+                graph_edge = GraphEdge(**edge.model_dump())
                 graph_edges.append(graph_edge)
         local_graph = LocalGraph(nodes=graph_nodes, edges=graph_edges, paper_id=json_path.stem)
-        return local_graph
+        return local_graph, None
 
     def add_embeddings_to_nodes(self, node: GraphNode) -> None:
         """Add embeddings to all nodes in the local graph."""
@@ -96,7 +100,7 @@ class LocalGraph(BaseModel):
                 self.embedding_model = SentenceTransformer(self.embedding_model_name)
 
             # Get embedding
-            embedding = self.embedding_model.encode(text, convert_to_numpy=True)
+            embedding = self.embedding_model.encode(text, batch_size=16, convert_to_numpy=True)
             return embedding.astype(np.float32)
         except Exception as e:
             print(f"Error getting embedding for text: {e}")
