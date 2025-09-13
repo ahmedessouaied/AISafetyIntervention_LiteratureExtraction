@@ -1,5 +1,5 @@
 paths:
-  input_dir: "./intervention_graph_creation/data/raw/ard_json"
+  input_dir: "./intervention_graph_creation/data/raw/ard_json_test"
   output_dir: "./intervention_graph_creation/data/processed"
 
 falkordb:
