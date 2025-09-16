@@ -3,6 +3,8 @@ import json
 import time
 from pathlib import Path
 from typing import Any, Optional, List, Dict
+import asyncio  # Async method
+from concurrent.futures import ThreadPoolExecutor  # Async method
 
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -290,8 +292,8 @@ class Extractor:
 
         return batch_requests
 
-    def create_batch_input_file(self, batch_requests: List[Dict]) -> str:
-        """Create and upload the batch input JSONL file."""
+    """ def create_batch_input_file(self, batch_requests: List[Dict]) -> str:
+        Create and upload the batch input JSONL file.
         batch_input_path = SETTINGS.paths.output_dir / "batch_input.jsonl"
 
         with batch_input_path.open("w", encoding="utf-8") as f:
@@ -306,6 +308,35 @@ class Extractor:
             )
 
         print(f"Uploaded batch input file: {batch_input_file.id}")
+        return batch_input_file.id """
+
+    # Modified version of create_batch_input_file to handle multiple batches
+    def create_batch_input_file(
+        self, batch_requests: List[Dict], batch_num: int = 1
+    ) -> str:
+        """Create and upload the batch input JSONL file."""
+        # Use unique filename for each batch to avoid conflicts
+        batch_input_path = (
+            SETTINGS.paths.output_dir
+            / f"batch_input_{batch_num}_{int(time.time())}.jsonl"
+        )
+
+        with batch_input_path.open("w", encoding="utf-8") as f:
+            for batch_req in batch_requests:
+                f.write(json.dumps(batch_req["request"], ensure_ascii=False) + "\n")
+
+        # Upload batch input file
+        with batch_input_path.open("rb") as f:
+            batch_input_file = self.client.files.create(
+                file=f,
+                purpose="batch",
+            )
+
+        print(f"📤 Uploaded batch input file: {batch_input_file.id}")
+
+        # Clean up local file after upload
+        batch_input_path.unlink()
+
         return batch_input_file.id
 
     def create_batch_job(
@@ -499,6 +530,140 @@ class Extractor:
             # Process results
             self.process_batch_results(completed_batch, batch_chunk)
 
+    # Async implementation starts here
+    async def process_dir_batch_async(
+        self,
+        input_dir: Path,
+        first_n: Optional[int] = None,
+        description: str = "Paper extraction batch",
+    ) -> None:
+        """Async version of process_dir_batch"""
+        SETTINGS.paths.output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Creating batch requests for files in {input_dir}")
+
+        # Create batch requests (keeping it synchronous)
+        batch_requests = await self._run_in_thread(
+            self.create_batch_requests, input_dir, first_n
+        )
+
+        if not batch_requests:
+            print("No files to process.")
+            return
+
+        print(f"Created {len(batch_requests)} batch requests")
+
+        # Split into smaller batches (max 50k requests per batch according to documentation)
+        max_batch_size = 5  # Can be modified
+        batch_chunks = []
+
+        for i in range(0, len(batch_requests), max_batch_size):
+            batch_chunk = batch_requests[i : i + max_batch_size]
+            batch_num = i // max_batch_size + 1
+            batch_chunks.append(
+                {
+                    "chunk": batch_chunk,
+                    "batch_num": batch_num,
+                    "description": f"{description} - Batch {batch_num}",
+                }
+            )
+
+        print(f"Processing {len(batch_chunks)} batches concurrently")
+
+        # Process all batches concurrently
+        tasks = []
+        for batch_info in batch_chunks:
+            task = asyncio.create_task(self._process_single_batch_async(batch_info))
+            tasks.append(task)
+
+        # Wait for all batches to complete
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Handle results and exceptions
+        successful_batches = 0
+        failed_batches = 0
+
+        for i, result in enumerate(results):
+            batch_num = batch_chunks[i]["batch_num"]
+            if isinstance(result, Exception):
+                print(f"❌ Error processing batch {batch_num}: {result}")
+                failed_batches += 1
+            else:
+                print(f"✅ Successfully completed batch {batch_num}")
+                successful_batches += 1
+
+        print(
+            f"\n Batch processing complete: {successful_batches} successful, {failed_batches} failed"
+        )
+
+    async def _process_single_batch_async(self, batch_info: Dict[str, Any]) -> None:
+        """Process a single batch asynchronously"""
+        batch_chunk = batch_info["chunk"]
+        batch_num = batch_info["batch_num"]
+        batch_description = batch_info["description"]
+
+        print(f"\n=== Starting Batch {batch_num}: ({len(batch_chunk)} requests) ===")
+
+        try:
+            # Create and upload batch input file
+            input_file_id = await self._run_in_thread(
+                self.create_batch_input_file, batch_chunk, batch_num
+            )
+
+            # Create batch job
+            batch_id = await self._run_in_thread(
+                self.create_batch_job, input_file_id, batch_description
+            )
+
+            print(f"Batch {batch_num} created with ID: {batch_id}")
+
+            # Wait for completion asynchronously
+            completed_batch = await self._wait_for_batch_completion_async(
+                batch_id, batch_num
+            )
+
+            # Process results
+            await self._run_in_thread(
+                self.process_batch_results, completed_batch, batch_chunk
+            )
+
+            print(f"=== ✅ Completed Batch {batch_num} ===")
+
+        except Exception as e:
+            print(f"❌ Error in batch {batch_num}: {e}")
+            raise
+
+    async def _wait_for_batch_completion_async(
+        self, batch_id: str, batch_num: int, check_interval: int = 60
+    ) -> Any:
+        """Async version of wait_for_batch_completion with non-blocking polling."""
+        print(f"⏳ Waiting for batch {batch_num}: ({batch_id}) to complete...")
+
+        while True:
+            # Check batch status in thread pool to avoid blocking event loop
+            batch = await self._run_in_thread(self.client.batches.retrieve, batch_id)
+
+            status = batch.status
+            print(f"📊 Batch {batch_num} status: {status}")
+
+            if status == "completed":
+                print(f"🎉 Batch {batch_num} completed successfully!")
+                return batch
+            elif status == "failed":
+                raise RuntimeError(f"Batch {batch_num} failed: {batch}")
+            elif status in ["expired", "cancelled"]:
+                raise RuntimeError(f"Batch {batch_num} was {status}")
+
+            # Wait before checking again (non-blocking)
+            await asyncio.sleep(check_interval)
+
+    async def _run_in_thread(self, func, *args, **kwargs):
+        """Run a synchronous function in a thread pool to avoid blocking the event loop."""
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as executor:
+            return await loop.run_in_executor(executor, func, *args, **kwargs)
+
+    # Async implementation ends here
+
     def process_pdf(self, path: Path) -> None:
         out_dir = SETTINGS.paths.output_dir / path.stem
         if out_dir.exists():
@@ -611,4 +776,12 @@ class Extractor:
 if __name__ == "__main__":
     extractor = Extractor()
     # extractor.process_dir(SETTINGS.paths.input_dir, 200)
-    extractor.process_dir_batch(SETTINGS.paths.input_dir, 3)
+    # extractor.process_dir_batch(SETTINGS.paths.input_dir, 3)
+    asyncio.run(
+        extractor.process_dir_batch_async(
+            # input_dir=SETTINGS.paths.input_dir,  # Or a directory with your input files
+            input_dir=SETTINGS.paths.input_dir,
+            first_n=10,  # Or set an integer to limit
+            description="Paper extraction batch",
+        )
+    )
