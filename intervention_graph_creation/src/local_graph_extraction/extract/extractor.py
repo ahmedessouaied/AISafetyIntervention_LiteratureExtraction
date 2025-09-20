@@ -531,13 +531,14 @@ class Extractor:
             self.process_batch_results(completed_batch, batch_chunk)
 
     # Async implementation starts here
+
     async def process_dir_batch_async(
         self,
         input_dir: Path,
         first_n: Optional[int] = None,
         description: str = "Paper extraction batch",
     ) -> None:
-        """Async version of process_dir_batch"""
+        """Async version of process_dir_batch, with automatic retry for failed requests."""
         SETTINGS.paths.output_dir.mkdir(parents=True, exist_ok=True)
         print(f"Creating batch requests for files in {input_dir}")
 
@@ -581,6 +582,7 @@ class Extractor:
         # Handle results and exceptions
         successful_batches = 0
         failed_batches = 0
+        error_batches = []  # Batches which contain failed requests
 
         for i, result in enumerate(results):
             batch_num = batch_chunks[i]["batch_num"]
@@ -591,9 +593,82 @@ class Extractor:
                 print(f"✅ Successfully completed batch {batch_num}")
                 successful_batches += 1
 
+                # Only collect non-null error_file_id
+                error_file_id = getattr(result, "error_file_id", None)
+                if error_file_id:
+                    error_batches.append(
+                        {
+                            "error_file_id": error_file_id,
+                            "batch_requests": batch_chunks[i]["chunk"],
+                        }
+                    )
+
         print(
             f"\n Batch processing complete: {successful_batches} successful, {failed_batches} failed"
         )
+        print(f"Found {len(error_batches)} error_file_ids to retry")
+
+        # Handle erronous requests if any
+        if error_batches:
+            print("\nProcessing Final Erroneous Batch")
+            await self._process_erroneous_requests(error_batches, description)
+
+    async def _process_erroneous_requests(
+        self, error_batches: List[Dict], description: str
+    ) -> None:
+        """Reprocess all erroneous requests from multiple error files."""
+
+        for error_batch in error_batches:
+            error_file_id = error_batch["error_file_id"]
+            original_requests = error_batch["batch_requests"]
+
+            if not error_file_id:
+                continue  # skip null
+
+            error_response = self.client.files.content(error_file_id)
+            error_content = error_response.text
+            print(f"\nProcessing error file: {error_file_id}")
+
+            # Rebuild failed requests
+            failed_batch_requests = []
+            for line in error_content.strip().split("\n"):
+                if not line:
+                    continue
+                error_result = json.loads(line)
+                custom_id = error_result.get("custom_id")
+
+                # Match original request by custom_id
+                for req in original_requests:
+                    req_custom_id = req.get("custom_id") or req.get("request", {}).get(
+                        "custom_id"
+                    )
+                    if req_custom_id == custom_id:
+                        failed_batch_requests.append(req)
+                        break
+
+            if not failed_batch_requests:
+                print(f"No valid failed requests found in {error_file_id}")
+                continue
+
+            print(
+                f"Reprocessing {len(failed_batch_requests)} failed requests from {error_file_id}"
+            )
+
+            # Run batch operations in thread to avoid blocking
+            await self._run_in_thread(
+                self._process_retry_batch, failed_batch_requests, description
+            )
+
+    async def _process_retry_batch(
+        self, failed_requests: List[Dict], description: str
+    ) -> None:
+        """Helper method to process retry batch synchronously in a thread."""
+        batch_input_file_id = self.create_batch_input_file(failed_requests)
+        new_batch_id = self.create_batch_job(
+            batch_input_file_id, description=f"{description} - Retry"
+        )
+        new_batch_result = self.wait_for_batch_completion(new_batch_id)
+        self.process_batch_results(new_batch_result, failed_requests)
 
     async def _process_single_batch_async(self, batch_info: Dict[str, Any]) -> None:
         """Process a single batch asynchronously"""
@@ -627,6 +702,9 @@ class Extractor:
             )
 
             print(f"=== ✅ Completed Batch {batch_num} ===")
+
+            # Return complete batch object for erronous request verification
+            return completed_batch
 
         except Exception as e:
             print(f"❌ Error in batch {batch_num}: {e}")
