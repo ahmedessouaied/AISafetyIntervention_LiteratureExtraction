@@ -1,16 +1,22 @@
 import os
 import json
+import csv
 import time
 from pathlib import Path
 from typing import Any, Optional, List, Dict
+from pydantic import ValidationError
 import asyncio  # Async method
 from concurrent.futures import ThreadPoolExecutor  # Async method
 
-from tqdm import tqdm
+import tqdm
 from dotenv import load_dotenv
 from openai import OpenAI
+from openai.lib._parsing._completions import type_to_response_format_param
 
 from config import load_settings
+from intervention_graph_creation.src.local_graph_extraction.extract.extraction_schema import (
+    ExtractionSchema,
+)
 from intervention_graph_creation.src.prompt.final_primary_prompt import PROMPT_EXTRACT
 from intervention_graph_creation.src.local_graph_extraction.extract.utilities import (
     safe_write,
@@ -24,6 +30,7 @@ from intervention_graph_creation.src.local_graph_extraction.extract.utilities im
 
 MODEL = "o3"
 REASONING_EFFORT = "medium"
+EMBEDDING_MODEL = "text-embedding-3-small"
 SETTINGS = load_settings()
 META_KEYS = frozenset(
     [
@@ -54,6 +61,9 @@ class Extractor:
         self._sum_out = 0
         self._sum_tot = 0
 
+    # Queue of invalid items to send to a future LLM judge
+    bad_requests_for_judge: List[Dict] = []
+
     def upload_pdf_get_id(self, pdf_path: Path) -> str:
         with pdf_path.open("rb") as fh:
             f = self.client.files.create(file=fh, purpose="user_data")
@@ -73,28 +83,35 @@ class Extractor:
             model=MODEL,
             input=messages,
             reasoning={"effort": REASONING_EFFORT},
+            text_format=ExtractionSchema,
         )
 
     def call_openai_text(self, file_text: str) -> Any:
         messages = [
             {
-                "role": "user",
+                "role": "developer",
                 "content": [
                     {"type": "input_text", "text": PROMPT_EXTRACT},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
                     {
                         "type": "input_text",
                         "text": f"\n\nHere is the paper for analysis:\n\n{file_text}",
                     },
                 ],
-            }
+            },
         ]
         return self.client.responses.parse(
             model=MODEL,
             input=messages,
             reasoning={"effort": REASONING_EFFORT},
+            text_format=ExtractionSchema,
         )
 
-    def write_outputs(self, out_dir: Path, stem: str, resp: Any, meta: json) -> None:
+    def write_outputs(self, out_dir: Path, stem: str, resp: Any, meta: Any) -> None:
         raw_path = out_dir / f"{stem}_raw_response.txt"
         json_path = out_dir / f"{stem}.json"
         summary_path = out_dir / f"{stem}_summary.txt"
@@ -167,7 +184,7 @@ class Extractor:
         batch_requests = []
 
         pdf_files = list(input_dir.glob("*.pdf"))
-        # jsonl_files = list(input_dir.glob("*.jsonl"))
+        jsonl_files = list(input_dir.glob("*.jsonl"))
 
         if first_n:
             pdf_files = pdf_files[:first_n]
@@ -198,6 +215,9 @@ class Extractor:
                             }
                         ],
                         "reasoning": {"effort": REASONING_EFFORT},
+                        "response_format": type_to_response_format_param(
+                            ExtractionSchema
+                        ),
                     },
                 }
                 batch_requests.append(
@@ -209,16 +229,16 @@ class Extractor:
                     }
                 )
             except Exception as e:
-                write_failure(SETTINGS.paths.ouput_dir, pdf_path.stem, e)
+                write_failure(SETTINGS.paths.output_dir, pdf_path.stem, e)
 
         # Process JSONL files
         json_items_cap = first_n if first_n else None
         # TEMPORARY: Only process arxiv.jsonl
-        arxiv_jsonl_path = input_dir / "arxiv.jsonl"
-        jsonl_files_filtered = [arxiv_jsonl_path] if arxiv_jsonl_path.exists() else []
+        # arxiv_jsonl_path = input_dir / "arxiv.jsonl"
+        # jsonl_files_filtered = [arxiv_jsonl_path] if arxiv_jsonl_path.exists() else []
 
         # for jsonl_path in jsonl_files:
-        for jsonl_path in jsonl_files_filtered:
+        for jsonl_path in jsonl_files:
             if json_items_cap is not None and json_items_cap <= 0:
                 break
 
@@ -275,6 +295,9 @@ class Extractor:
                                     }
                                 ],
                                 "reasoning": {"effort": REASONING_EFFORT},
+                                "response_format": type_to_response_format_param(
+                                    ExtractionSchema
+                                ),
                             },
                         }
 
@@ -386,7 +409,9 @@ class Extractor:
             results_content = file_response.text
 
             total_tokens = 0
-            processed_count = 0
+            processed_count = 0  # number of valid extractions written
+            invalid_count = 0
+            embedding_items: List[Dict] = []
 
             for line in results_content.strip().split("\n"):
                 if not line:
@@ -419,18 +444,41 @@ class Extractor:
                         out_dir = SETTINGS.paths.output_dir / paper_id
                         stem = paper_id
 
-                    out_dir.mkdir(parents=True, exist_ok=True)
-
-                    # Save outputs (adapt the response format as needed)
-                    self.write_batch_outputs(
-                        out_dir, stem, response_body, req_data["meta"]
+                    # Normalize payload and validate against ExtractionSchema
+                    normalized_payload = self._normalize_payload_from_response_body(
+                        response_body
                     )
+
+                    is_valid = False
+                    if normalized_payload is not None:
+                        is_valid = self._validate_extraction_payload(normalized_payload)
+
+                    if is_valid:
+                        # Only create dirs and write outputs when valid
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        self.write_batch_outputs(
+                            out_dir, stem, response_body, req_data["meta"]
+                        )
+                        processed_count += 1
+                        # Collect texts for embeddings
+                        try:
+                            texts = self._build_texts_for_embeddings(normalized_payload)
+                            for item in texts:
+                                item.update({"stem": stem, "out_dir": str(out_dir)})
+                                embedding_items.append(item)
+                        except Exception:
+                            pass
+                    else:
+                        invalid_count += 1
+                        self._enqueue_for_judge(
+                            custom_id=custom_id,
+                            req_data=req_data,
+                            response_body=response_body,
+                        )
 
                     # Track usage
                     if "usage" in response_body:
                         total_tokens += response_body["usage"].get("total_tokens", 0)
-
-                    processed_count += 1
 
                 except Exception as e:
                     print(f"Error processing result line: {e}")
@@ -438,7 +486,16 @@ class Extractor:
 
             print("\n=== Batch Processing Summary ===")
             print(f"Papers processed: {processed_count}")
+            print(f"Valid extractions written: {processed_count}")
+            print(f"Invalid (skipped) extractions: {invalid_count}")
             print(f"Total tokens used: {total_tokens}")
+
+            # Post-process embeddings for all valid items
+            if embedding_items:
+                try:
+                    self._run_embeddings_batch_and_write_csv(embedding_items)
+                except Exception as e:
+                    print(f"Embedding batch failed: {e}")
 
         # Process error file if it exists
         if batch.error_file_id:
@@ -453,7 +510,7 @@ class Extractor:
                     )
 
     def write_batch_outputs(
-        self, out_dir: Path, stem: str, response_body: Dict, meta: Dict
+        self, out_dir: Path, stem: str, response_body: Dict, meta: Any
     ) -> None:
         """Write batch response outputs to correspondant files."""
         raw_path = out_dir / f"{stem}_raw_response.txt"
@@ -485,8 +542,199 @@ class Extractor:
                     )
                 except json.JSONDecodeError as e:
                     write_failure(
-                        SETTINGS.paths.output_dir, stem, f"JSON parse error: {e}"
+                        SETTINGS.paths.output_dir,
+                        stem,
+                        Exception(f"JSON parse error: {e}"),
                     )
+
+    def _normalize_payload_from_response_body(
+        self, response_body: Dict
+    ) -> Optional[Dict]:
+        """Extract and parse the structured JSON payload intended to match ExtractionSchema.
+
+        Returns a dict if a JSON object can be extracted and parsed; otherwise None.
+        """
+        try:
+            # Typical shape: { choices: [ { message: { content: "...json..." } } ] }
+            output_text = ""
+            if isinstance(response_body, dict):
+                choices = response_body.get("choices")
+                if isinstance(choices, list) and choices:
+                    first = choices[0] or {}
+                    message = first.get("message") or {}
+                    output_text = message.get("content") or ""
+
+            if not output_text:
+                return None
+
+            text_part, json_part = split_text_and_json(output_text)
+            if not json_part:
+                return None
+            return json.loads(json_part)
+        except Exception:
+            return None
+
+    def _validate_extraction_payload(self, payload: Dict) -> bool:
+        """Return True if payload validates against ExtractionSchema, else False."""
+        try:
+            # Use Pydantic v2 API
+            ExtractionSchema.model_validate(payload)
+            return True
+        except ValidationError:
+            return False
+        except Exception:
+            return False
+
+    def _extract_output_text_from_response_body(self, response_body: Dict) -> str:
+        """Best-effort extraction of assistant text content from batch response body."""
+        try:
+            if isinstance(response_body, dict):
+                choices = response_body.get("choices")
+                if isinstance(choices, list) and choices:
+                    first = choices[0] or {}
+                    message = first.get("message") or {}
+                    content = message.get("content") or ""
+                    return content if isinstance(content, str) else str(content)
+        except Exception:
+            pass
+        return ""
+
+    def _enqueue_for_judge(
+        self,
+        custom_id: str,
+        req_data: Dict,
+        response_body: Dict,
+    ) -> None:
+        """Store minimal info + original request so a judge can repair later."""
+        try:
+            file_type = req_data.get("file_type")
+            identifier = (
+                getattr(req_data.get("file_path"), "stem", None)
+                if file_type == "pdf"
+                else req_data.get("paper_id")
+            )
+            output_text = self._extract_output_text_from_response_body(response_body)
+            Extractor.bad_requests_for_judge.append(
+                {
+                    "custom_id": custom_id,
+                    "file_type": file_type,
+                    "identifier": identifier,
+                    "request": req_data.get("request"),
+                    "output_text": output_text,
+                }
+            )
+        except Exception:
+            pass
+
+    def _build_texts_for_embeddings(self, payload: Dict) -> List[Dict]:
+        """Create text representations for nodes and edges for embedding."""
+        items: List[Dict] = []
+
+        # Nodes
+        for idx, node in enumerate(payload.get("nodes", []) or []):
+            parts: List[str] = []
+            name = node.get("name")
+            if name:
+                parts.append(f"Name: {name}")
+            desc = node.get("description")
+            if desc:
+                parts.append(f"Description: {desc}")
+            aliases = node.get("aliases") or []
+            if isinstance(aliases, list) and aliases:
+                parts.append(f"Aliases: {', '.join([str(a) for a in aliases])}")
+            concept_category = node.get("concept_category")
+            if concept_category:
+                parts.append(f"Category: {concept_category}")
+            text = " | ".join(parts)
+            key = name or f"node_{idx}"
+            items.append({"kind": "node", "key": key, "text": text})
+
+        # Edges from logical chains
+        for lc_idx, chain in enumerate(payload.get("logical_chains", []) or []):
+            chain_title = chain.get("title")
+            for e_idx, edge in enumerate(chain.get("edges", []) or []):
+                parts: List[str] = []
+                etype = edge.get("type")
+                if etype:
+                    parts.append(f"Type: {etype}")
+                desc = edge.get("description")
+                if desc:
+                    parts.append(f"Description: {desc}")
+                if chain_title:
+                    parts.append(f"Concept: {chain_title}")
+                src = edge.get("source_node")
+                if src:
+                    parts.append(f"From: {src}")
+                tgt = edge.get("target_node")
+                if tgt:
+                    parts.append(f"To: {tgt}")
+                text = " | ".join(parts)
+                key = f"edge_{lc_idx}_{e_idx}"
+                items.append({"kind": "edge", "key": key, "text": text})
+
+        return items
+
+    def _run_embeddings_batch_and_write_csv(self, embedding_items: List[Dict]) -> None:
+        """Submit an embeddings batch for the given items and write per-paper CSVs."""
+        # Build batch requests
+        batch_requests: List[Dict] = []
+        for i, item in enumerate(embedding_items):
+            custom_id = f"emb__{item['stem']}__{item['kind']}__{item['key']}__{i}"
+            request = {
+                "custom_id": custom_id,
+                "method": "POST",
+                "url": "/v1/embeddings",
+                "body": {
+                    "model": EMBEDDING_MODEL,
+                    "input": item["text"],
+                },
+            }
+            batch_requests.append({"request": request})
+
+        # Create and run batch
+        input_file_id = self.create_batch_input_file(batch_requests)
+        batch_id = self.create_batch_job(input_file_id, "Embeddings batch")
+        completed_batch = self.wait_for_batch_completion(batch_id)
+
+        # Parse results
+        all_rows: List[List[str]] = []
+        if completed_batch.output_file_id:
+            file_response = self.client.files.content(completed_batch.output_file_id)
+            results_content = file_response.text
+            for line in results_content.strip().split("\n"):
+                if not line:
+                    continue
+                try:
+                    result = json.loads(line)
+                    if result.get("error"):
+                        continue
+                    body = result.get("response", {}).get("body", {})
+                    data = body.get("data") or []
+                    if not data:
+                        continue
+                    emb = data[0].get("embedding")
+                    if not isinstance(emb, list):
+                        continue
+                    cid = result.get("custom_id", "")
+                    parts = cid.split("__", 4)
+                    if len(parts) < 5:
+                        continue
+                    _, stem, kind, key, _idx = parts
+                    row = [stem, kind, key, json.dumps(emb)]
+                    all_rows.append(row)
+                except Exception:
+                    continue
+
+        # Write a single CSV for all papers
+        if all_rows:
+            csv_path = SETTINGS.paths.output_dir / f"embeddings_{int(time.time())}.csv"
+            try:
+                with csv_path.open("w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["stem", "kind", "key", "embedding_json"])
+                    writer.writerows(all_rows)
+            except Exception:
+                pass
 
     def process_dir_batch(
         self,
@@ -858,8 +1106,10 @@ if __name__ == "__main__":
     asyncio.run(
         extractor.process_dir_batch_async(
             # input_dir=SETTINGS.paths.input_dir,  # Or a directory with your input files
-            input_dir=SETTINGS.paths.input_dir,
-            first_n=10,  # Or set an integer to limit
+            input_dir=Path(
+                "/home/legacy/Research/SOAR-5-INC-2/AISafetyIntervention_LiteratureExtraction/intervention_graph_creation/data/raw/try"
+            ),
+            first_n=2,  # Or set an integer to limit
             description="Paper extraction batch",
         )
     )
