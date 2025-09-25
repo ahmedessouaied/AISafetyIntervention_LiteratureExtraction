@@ -452,6 +452,31 @@ class Extractor:
                         f"Error for {error_result['custom_id']}: {error_result['error']}"
                     )
 
+
+    
+    def get_output_text_from_response_body(self, response_body: Dict) -> (str, Optional[Dict]):
+        """Get the output text from an openAI response body from a batch api request"""
+        if "output" not in response_body:
+            raise ValueError("Response body does not contain 'output' field")
+        output = response_body["output"]
+        message = self._find_message(output)
+        if message["status"] != "completed":
+            raise ValueError(f"Message status is not completed: {message['status']}")
+        output_text = self._find_output_text(message["content"])
+        return output_text["text"]
+    def _find_message(self, output: List[Dict]):
+        """Helper function for `get_output_text_from_response_body`."""
+        for item in output:
+            if "type" in item and item["type"] == "message":
+                return item
+        raise ValueError("No message found in output list")
+    def _find_output_text(self, content: List[Dict]):
+        """Helper function for `get_output_text_from_response_body`."""
+        for item in content:
+            if "type" in item and item["type"] == "output_text":
+                return item
+        raise ValueError("No output_text found in content")
+
     def write_batch_outputs(
         self, out_dir: Path, stem: str, response_body: Dict, meta: Dict
     ) -> None:
@@ -464,12 +489,7 @@ class Extractor:
         safe_write(raw_path, json.dumps(response_body, ensure_ascii=False, indent=2))
 
         # Extract output text from response
-        # Note: You may need to adjust this based on the actual response format
-        output_text = ""
-        if "choices" in response_body and response_body["choices"]:
-            choice = response_body["choices"][0]
-            if "message" in choice and "content" in choice["message"]:
-                output_text = choice["message"]["content"]
+        output_text = self.get_output_text_from_response_body(response_body)
 
         if output_text:
             text_part, json_part = split_text_and_json(output_text)
