@@ -292,24 +292,6 @@ class Extractor:
 
         return batch_requests
 
-    """ def create_batch_input_file(self, batch_requests: List[Dict]) -> str:
-        Create and upload the batch input JSONL file.
-        batch_input_path = SETTINGS.paths.output_dir / "batch_input.jsonl"
-
-        with batch_input_path.open("w", encoding="utf-8") as f:
-            for batch_req in batch_requests:
-                f.write(json.dumps(batch_req["request"], ensure_ascii=False) + "\n")
-
-        # Upload batch input file
-        with batch_input_path.open("rb") as f:
-            batch_input_file = self.client.files.create(
-                file=f,
-                purpose="batch",
-            )
-
-        print(f"Uploaded batch input file: {batch_input_file.id}")
-        return batch_input_file.id """
-
     # Modified version of create_batch_input_file to handle multiple batches
     def create_batch_input_file(
         self, batch_requests: List[Dict], batch_num: int = 1
@@ -555,6 +537,7 @@ class Extractor:
         self,
         input_dir: Path,
         first_n: Optional[int] = None,
+        batch_size: int = 5,
         description: str = "Paper extraction batch",
     ) -> None:
         """Async version of process_dir_batch, with automatic retry for failed requests."""
@@ -573,7 +556,7 @@ class Extractor:
         print(f"Created {len(batch_requests)} batch requests")
 
         # Split into smaller batches (max 50k requests per batch according to documentation)
-        max_batch_size = 5  # Can be modified
+        max_batch_size = batch_size
         batch_chunks = []
 
         for i in range(0, len(batch_requests), max_batch_size):
@@ -872,13 +855,20 @@ class Extractor:
 
 if __name__ == "__main__":
     extractor = Extractor()
-    # extractor.process_dir(SETTINGS.paths.input_dir, 200)
-    # extractor.process_dir_batch(SETTINGS.paths.input_dir, 3)
-    asyncio.run(
-        extractor.process_dir_batch_async(
-            # input_dir=SETTINGS.paths.input_dir,  # Or a directory with your input files
-            input_dir=SETTINGS.paths.input_dir,
-            first_n=10,  # Or set an integer to limit
-            description="Paper extraction batch",
+
+    input_dir = SETTINGS.paths.input_dir
+
+    total_articles = 100
+
+    batch_size = 10
+
+    async def main():
+
+        await extractor.process_dir_batch_async(
+            input_dir=input_dir,
+            first_n=total_articles,
+            batch_size=batch_size,
+            description=f"Paper extraction (100, {batch_size} per batch)"
         )
-    )
+
+    asyncio.run(main())
